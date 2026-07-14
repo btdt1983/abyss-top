@@ -1,0 +1,213 @@
+name: release
+
+# Tagged release pipeline.
+# - Triggers on tags v*.*.* (e.g. v1.0.0, v1.2.3-rc1).
+# - Three jobs in parallel after the sanity check:
+#     1. Static musl tarball  (drops onto any modern x86_64 Linux)
+#     2. RPM build in Rocky 9 (works on RHEL 9 / Rocky 9 / AlmaLinux 9)
+# - All artifacts uploaded to a single GitHub Release.
+# - workflow_dispatch supported for dry-runs.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------- 1. Sanity check ---------------------------------------------
+  check:
+    name: check (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked --all-targets
+
+  # ---------- 2. Static musl tarball --------------------------------------
+  build-linux-musl:
+    name: build x86_64-linux-musl tarball
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - run: strip target/x86_64-unknown-linux-musl/release/abyss-top
+
+      - name: Verify static linkage
+        run: |
+          set -e
+          BIN=target/x86_64-unknown-linux-musl/release/abyss-top
+          file "$BIN"
+          if file "$BIN" | grep -q "dynamically linked"; then
+            echo "ERROR: binary is dynamically linked — refusing to publish."
+            exit 1
+          fi
+
+      - name: Package tarball
+        id: pkg
+        run: |
+          set -e
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          STAGE="abyss-top-${VERSION}-x86_64-linux"
+          mkdir -p "dist/${STAGE}"
+          cp target/x86_64-unknown-linux-musl/release/abyss-top "dist/${STAGE}/"
+          cp README.md LICENSE "dist/${STAGE}/" 2>/dev/null || true
+          tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
+          ( cd dist && sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256" )
+          echo "tarball=dist/${STAGE}.tar.gz"        >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${STAGE}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: abyss-top-x86_64-linux-musl
+          path: |
+            ${{ steps.pkg.outputs.tarball }}
+            ${{ steps.pkg.outputs.checksum }}
+          if-no-files-found: error
+
+  # ---------- 3. RPM build (Rocky 9 = RHEL 9 ABI) -------------------------
+  build-rpm-el9:
+    name: build RPM (el9, x86_64)
+    needs: check
+    runs-on: ubuntu-latest
+    container:
+      image: rockylinux:9
+    steps:
+      - name: Install build dependencies
+        run: |
+          set -e
+          dnf install -y --setopt=install_weak_deps=False \
+            gcc rpm-build rpmdevtools git tar findutils file which \
+            ca-certificates
+          # Rust via rustup — RHEL 9's pakket-rust is vaak achter op edition 2021
+          # en op het versie-minimum dat moderne crates eisen.
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v4
+
+      - name: Set version from tag
+        id: ver
+        run: |
+          set -e
+          REF="${GITHUB_REF_NAME:-v0.0.0}"
+          # Strip leading 'v' uit de tag (v1.0.0 → 1.0.0).
+          VERSION="${REF#v}"
+          # Pre-release suffix (1.0.0-rc1) is niet RPM-vriendelijk; vervang
+          # streepje door tilde zodat versie-vergelijking correct sorteert.
+          VERSION_RPM="${VERSION//-/\~}"
+          echo "version=${VERSION_RPM}" >> "$GITHUB_OUTPUT"
+          echo "Version for RPM: ${VERSION_RPM}"
+
+      - name: Stage sources
+        run: |
+          set -e
+          rpmdev-setuptree
+          V="${{ steps.ver.outputs.version }}"
+          TMP="$(mktemp -d)"
+          cp -a . "${TMP}/abyss-top-${V}"
+          # Verwijder VCS-rommel en build-output uit het tarball.
+          rm -rf "${TMP}/abyss-top-${V}/.git" \
+                 "${TMP}/abyss-top-${V}/target" \
+                 "${TMP}/abyss-top-${V}/dist"
+          tar -C "${TMP}" -czf "$HOME/rpmbuild/SOURCES/abyss-top-${V}.tar.gz" \
+              "abyss-top-${V}"
+          # Spec naar SPECS-dir, met versie ingevuld vanuit de tag.
+          sed -e "s/^Version:.*$/Version:        ${V}/" \
+              packaging/abyss-top.spec > "$HOME/rpmbuild/SPECS/abyss-top.spec"
+
+      - name: Build RPM
+        run: |
+          set -e
+          rpmbuild -ba "$HOME/rpmbuild/SPECS/abyss-top.spec"
+
+      - name: Collect RPMs
+        id: pkg
+        run: |
+          set -e
+          mkdir -p dist
+          cp "$HOME"/rpmbuild/RPMS/x86_64/*.rpm dist/
+          cp "$HOME"/rpmbuild/SRPMS/*.rpm dist/
+          ( cd dist && for f in *.rpm; do sha256sum "$f" > "$f.sha256"; done )
+          ls -la dist/
+          # Voer alle bestanden terug als output op één regel.
+          {
+            echo "files<<EOF"
+            ls dist/*.rpm dist/*.sha256 | sed 's|^|dist/|;s|^dist/dist/|dist/|'
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify RPM metadata
+        run: |
+          set -e
+          for f in dist/*.x86_64.rpm; do
+            echo "=== $f ==="
+            rpm -qip "$f"
+            echo "--- files ---"
+            rpm -qlp "$f"
+            echo "--- requires ---"
+            rpm -qRp "$f"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: abyss-top-rpm-el9
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------- 4. Publish to GitHub Release (tag pushes only) --------------
+  publish:
+    name: publish GitHub Release
+    needs: [build-linux-musl, build-rpm-el9]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          set -e
+          mkdir -p release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.rpm' \
+                                    -o -name '*.sha256' \) \
+            -exec cp -v {} release/ \;
+          ls -la release/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

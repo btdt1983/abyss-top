@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.idea/
+.vscode/
+*.swp
+dist/
+.claude/settings.local.json
