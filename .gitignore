@@ -5,4 +5,4 @@ Cargo.lock.bak
 .vscode/
 *.swp
 dist/
-.claude/settings.local.json
+.claude/
