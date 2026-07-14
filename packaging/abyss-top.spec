@@ -91,8 +91,3 @@ fi
   DAC-gated. This silently zeroed disk/net throughput for non-root,
   setcap-only deployments whenever guests don't run under the same uid as
   abyss-top (root use masked it). %%post now also sets CAP_SYS_PTRACE.
-
-* Tue May 19 2026 David <david@cerberus.io> - 1.0.0-1
-- Initial RPM release.
-- Adds disk I/O and network throughput per VM.
-- Sets CAP_DAC_READ_SEARCH in %%post for non-root /proc/<pid>/io access.
