@@ -12,13 +12,14 @@ FIPS-locked environments, SSH-only ops).
 ┌────────────────────────────────────────────────────────────────────────────┐
 │ Abyss-Top | KVM Hypervisor Monitor  [3 VMs]                                │
 └────────────────────────────────────────────────────────────────────────────┘
-┌ Guests (sorted by CPU) ────────────────────────────────────────────────────┐
-│ PID    VM Name                CPU %   MEM (MB)   DISK R/W           NET RX/TX        │
-│ 12847  cerberus-node01         87.3       8192   12.4 MB/s / 3.1 MB/s    870 KB/s /  410 KB/s │
-│ 12931  abyssos-build-runner    42.1       4096    2.1 MB/s / 5.6 MB/s    120 KB/s /   85 KB/s │
-│ 13102  rocky9-test-vm           3.4       2048      45 KB/s /   12 KB/s    8 KB/s /    2 KB/s │
-│                                                                                       │
-└────────────────────────────────────────────────────────────────────────────┘
+┌ Guests (sorted by CPU) ──────────────────────────────────────────────────────────────┐
+│ PID    VM Name               STATE  UPTIME   CPU %   MEM (MB)   DISK R/W            NET RX/TX      │
+│ 12847  cerberus-node01       up     4d2h      87.3       8192   12.4 MB/s / 3.1 MB/s  870 KB/s / 410 KB/s │
+│ 12931  abyssos-build-runner  up     18h30m    42.1       4096    2.1 MB/s / 5.6 MB/s  120 KB/s /  85 KB/s │
+│ 13102  rocky9-test-vm        io     3h5m       3.4       2048      45 KB/s /  12 KB/s    8 KB/s /   2 KB/s │
+│                                                                                                          │
+│ TOTAL  3 VMs                                  132.8      14336   14.5 MB/s / 8.7 MB/s  998 KB/s / 497 KB/s │
+└──────────────────────────────────────────────────────────────────────────────────────┘
 ┌────────────────────────────────────────────────────────────────────────────┐
 │ Host CPU  44.2%   RAM 14336/32768 MB (43.8%)   sort [C]pu [D]isk [N]et [M]em · [Q]uit │
 └────────────────────────────────────────────────────────────────────────────┘
@@ -28,8 +29,10 @@ Colours in the live UI:
 
 - **Abyss-Top** title — cyan bold; VM count badge yellow
 - Table header — black on cyan
+- STATE cell — green (`up`), yellow (`io`), red (`stop` / `dead`)
 - CPU % cell — green (<40), yellow (40–80), red (≥80)
 - Disk R/W column — magenta; Net RX/TX column — light blue
+- TOTAL row — bold, keeping each column's colour
 - Footer host stats — white bold on a dark-gray block
 
 ---
@@ -40,9 +43,12 @@ Colours in the live UI:
 - Parses the VM name from QEMU argv (`-name guest=foo,debug-threads=on`,
   `-name foo`, `--name foo`, `-name=foo`)
 - Per-VM CPU%, RSS, disk read/write throughput, network RX/TX throughput
+- Per-VM state (`up` / `io` / `stop` / `dead`) and uptime
+- A `TOTAL` row summing CPU / memory / disk / net across all guests
 - Host CPU + RAM totals in the footer
 - 1 s refresh, sub-millisecond rendering, single binary
 - Live sorting by CPU / disk I/O / net I/O / memory (`C` / `D` / `N` / `M`)
+- vCPU / NUMA placement + host-contention detail view (`Enter` on a guest)
 - Panic-safe terminal restore — your shell will never be left in raw mode
 
 ---
@@ -222,6 +228,8 @@ The active sort is shown in the guest-table title (`Guests (sorted by …)`).
 |---------------------|-------------------------------------|
 | Process discovery   | `sysinfo` — filters on `qemu-system*`, `qemu-kvm`, `kvm` (name + exe path) |
 | VM name             | QEMU argv `-name` parser (all four common forms) |
+| State               | `sysinfo` process status (the state field of `/proc/[pid]/stat`): `up` (Run/Sleep/Idle), `io` (uninterruptible disk-sleep — a possible storage stall), `stop` (SIGSTOP'd or traced), `dead` (zombie/dead). This is the **OS process state, not the libvirt domain state** — a libvirt-*paused* guest keeps its QEMU process in Sleep, so it still reads `up`. What it surfaces is a hung, frozen, or defunct QEMU process, using only `/proc` (no QMP/libvirt). |
+| Uptime              | `sysinfo` process run time (`/proc/[pid]/stat` start time vs. host boot) |
 | CPU %               | `sysinfo` per-process CPU usage — summed across all vCPU threads, so a busy multi-vCPU guest can read **above 100 %** (e.g. `780.0` for 8 fully-loaded vCPUs). This is intentional: it reflects real host load. |
 | Memory (MB)         | `sysinfo` RSS / 1024²               |
 | Disk R/W            | `/proc/[pid]/io` — `read_bytes` / `write_bytes`, delta per tick |

@@ -35,7 +35,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
     Frame, Terminal,
 };
-use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+use sysinfo::{ProcessRefreshKind, ProcessStatus, RefreshKind, System};
 
 // Refresh-cadans. sysinfo CPU% vereist >= MINIMUM_CPU_UPDATE_INTERVAL tussen
 // refreshes; 1 s zit ruim boven de ~200ms ondergrens en geeft stabiele delta's.
@@ -100,6 +100,11 @@ struct VmStats {
     cpu_pct: f32,
     mem_mb: u64, // RSS in MB
 
+    /// Vereenvoudigde OS-processtatus (zie `VmState`) — niet de libvirt-domeinstatus.
+    state: VmState,
+    /// Looptijd van het QEMU-proces in seconden (sysinfo `run_time()`).
+    uptime_secs: u64,
+
     // Throughput in bytes/s, berekend uit delta tussen twee ticks.
     disk_read_bps: u64,
     disk_write_bps: u64,
@@ -131,6 +136,55 @@ impl SortBy {
             SortBy::DiskIo => "disk I/O",
             SortBy::NetIo => "net I/O",
             SortBy::Memory => "memory",
+        }
+    }
+}
+
+/// Vereenvoudigde weergave van de OS-processtatus (uit `/proc/[pid]/stat`, via
+/// sysinfo). LET OP: dit is de status van het QEMU-*proces*, niet de
+/// libvirt-domeinstatus. Een libvirt-"paused" guest laat het QEMU-proces in
+/// Sleep staan, dus die toont hier gewoon `up`. Wat wél opvalt: een met SIGSTOP
+/// bevroren QEMU (`stop`), een op storage vastgelopen proces (`io`), of een
+/// gecrashte/afstervende guest (`dead`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmState {
+    Running,
+    IoWait,
+    Stopped,
+    Dead,
+    Unknown,
+}
+
+impl VmState {
+    fn from_status(status: ProcessStatus) -> Self {
+        match status {
+            ProcessStatus::Run | ProcessStatus::Sleep | ProcessStatus::Idle => VmState::Running,
+            ProcessStatus::UninterruptibleDiskSleep => VmState::IoWait,
+            ProcessStatus::Stop | ProcessStatus::Tracing => VmState::Stopped,
+            ProcessStatus::Zombie | ProcessStatus::Dead => VmState::Dead,
+            _ => VmState::Unknown,
+        }
+    }
+
+    /// Korte cellabel voor de tabel.
+    fn label(self) -> &'static str {
+        match self {
+            VmState::Running => "up",
+            VmState::IoWait => "io",
+            VmState::Stopped => "stop",
+            VmState::Dead => "dead",
+            VmState::Unknown => "?",
+        }
+    }
+
+    /// Kleur: groen = normaal, geel = let op (I/O-wait), rood = fout
+    /// (bevroren of dood), grijs = onbekend.
+    fn color(self) -> Color {
+        match self {
+            VmState::Running => Color::Green,
+            VmState::IoWait => Color::Yellow,
+            VmState::Stopped | VmState::Dead => Color::Red,
+            VmState::Unknown => Color::DarkGray,
         }
     }
 }
@@ -293,6 +347,8 @@ impl App {
                 // vol belast). Bewust: het weerspiegelt de echte hostbelasting.
                 cpu_pct: p.cpu_usage(),
                 mem_mb: p.memory() / 1024 / 1024, // RSS
+                state: VmState::from_status(p.status()),
+                uptime_secs: p.run_time(),
                 disk_read_bps: d_r,
                 disk_write_bps: d_w,
                 net_rx_bps: n_rx,
@@ -813,6 +869,24 @@ fn read_numa_maps(pid: u32) -> io::Result<HashMap<u32, u64>> {
 // ---------- Formatters ----------------------------------------------------
 
 /// Bytes/s naar leesbare string met auto-schaling.
+/// Compacte looptijd-weergave voor een tabelcel: de twee grootste significante
+/// eenheden (bv. "4d2h", "18h30m", "45m10s", "12s").
+fn fmt_uptime(secs: u64) -> String {
+    let d = secs / 86_400;
+    let h = (secs % 86_400) / 3_600;
+    let m = (secs % 3_600) / 60;
+    let s = secs % 60;
+    if d > 0 {
+        format!("{d}d{h}h")
+    } else if h > 0 {
+        format!("{h}h{m}m")
+    } else if m > 0 {
+        format!("{m}m{s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
 fn fmt_bps(bps: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
@@ -896,6 +970,8 @@ mod ui {
         let header = Row::new(vec![
             Cell::from("PID"),
             Cell::from("VM Name"),
+            Cell::from("STATE"),
+            Cell::from("UPTIME"),
             Cell::from("CPU %"),
             Cell::from("MEM (MB)"),
             Cell::from("DISK R/W"),
@@ -904,13 +980,15 @@ mod ui {
         .style(header_style)
         .height(1);
 
-        let rows: Vec<Row> = if vms.is_empty() {
+        let mut rows: Vec<Row> = if vms.is_empty() {
             vec![Row::new(vec![
                 Cell::from("-"),
                 Cell::from(Span::styled(
                     "No running QEMU/KVM guests detected",
                     Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
                 )),
+                Cell::from("-"),
+                Cell::from("-"),
                 Cell::from("-"),
                 Cell::from("-"),
                 Cell::from("-"),
@@ -931,6 +1009,11 @@ mod ui {
                             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
                         )),
                         Cell::from(Span::styled(
+                            v.state.label(),
+                            Style::default().fg(v.state.color()),
+                        )),
+                        Cell::from(fmt_uptime(v.uptime_secs)),
+                        Cell::from(Span::styled(
                             format!("{:>6.1}", v.cpu_pct),
                             Style::default().fg(cpu_color),
                         )),
@@ -948,10 +1031,55 @@ mod ui {
                 .collect()
         };
 
+        // Totaalregel: sommeert CPU/mem/disk/net over alle VM's. Boven de rij een
+        // lege regel (top_margin) als visuele scheider, geen aparte dash-rij nodig.
+        // Nooit selecteerbaar: de cursor is geklemd op vms.len()-1, deze rij zit
+        // op index vms.len().
+        if !vms.is_empty() {
+            let n = vms.len();
+            let tot_cpu: f32 = vms.iter().map(|v| v.cpu_pct).sum();
+            let tot_mem: u64 = vms.iter().map(|v| v.mem_mb).sum();
+            let tot_dr: u64 = vms.iter().map(|v| v.disk_read_bps).sum();
+            let tot_dw: u64 = vms.iter().map(|v| v.disk_write_bps).sum();
+            let tot_rx: u64 = vms.iter().map(|v| v.net_rx_bps).sum();
+            let tot_tx: u64 = vms.iter().map(|v| v.net_tx_bps).sum();
+            let bold = Modifier::BOLD;
+            rows.push(
+                Row::new(vec![
+                    Cell::from(Span::styled("TOTAL", Style::default().fg(Color::Cyan).add_modifier(bold))),
+                    Cell::from(Span::styled(
+                        format!("{} VM{}", n, if n == 1 { "" } else { "s" }),
+                        Style::default().fg(Color::White).add_modifier(bold),
+                    )),
+                    Cell::from(""), // STATE — n.v.t. voor het totaal
+                    Cell::from(""), // UPTIME — n.v.t. voor het totaal
+                    Cell::from(Span::styled(
+                        format!("{:>6.1}", tot_cpu),
+                        Style::default().fg(Color::White).add_modifier(bold),
+                    )),
+                    Cell::from(Span::styled(
+                        format!("{:>8}", tot_mem),
+                        Style::default().fg(Color::White).add_modifier(bold),
+                    )),
+                    Cell::from(Span::styled(
+                        fmt_rw(tot_dr, tot_dw),
+                        Style::default().fg(Color::Magenta).add_modifier(bold),
+                    )),
+                    Cell::from(Span::styled(
+                        fmt_rw(tot_rx, tot_tx),
+                        Style::default().fg(Color::LightBlue).add_modifier(bold),
+                    )),
+                ])
+                .top_margin(1),
+            );
+        }
+
         // Vaste breedtes voor numerieke kolommen; VM Name vult de rest.
         let widths = [
             Constraint::Length(8),      // PID
-            Constraint::Percentage(22), // VM Name
+            Constraint::Percentage(18), // VM Name
+            Constraint::Length(6),      // STATE
+            Constraint::Length(8),      // UPTIME
             Constraint::Length(8),      // CPU %
             Constraint::Length(10),     // MEM
             Constraint::Length(24),     // DISK R/W
@@ -1318,10 +1446,12 @@ Inter-|   Receive                                                |  Transmit
         let mut vms = vec![
             VmStats {
                 pid: 1, name: "a".into(), cpu_pct: 10.0, mem_mb: 0,
+                state: VmState::Running, uptime_secs: 0,
                 disk_read_bps: 0, disk_write_bps: 0, net_rx_bps: 0, net_tx_bps: 0,
             },
             VmStats {
                 pid: 2, name: "b".into(), cpu_pct: 50.0, mem_mb: 0,
+                state: VmState::Running, uptime_secs: 0,
                 disk_read_bps: 0, disk_write_bps: 0, net_rx_bps: 0, net_tx_bps: 0,
             },
         ];
@@ -1334,15 +1464,54 @@ Inter-|   Receive                                                |  Transmit
         let mut vms = vec![
             VmStats {
                 pid: 1, name: "a".into(), cpu_pct: 0.0, mem_mb: 0,
+                state: VmState::Running, uptime_secs: 0,
                 disk_read_bps: 100, disk_write_bps: 100, net_rx_bps: 0, net_tx_bps: 0,
             },
             VmStats {
                 pid: 2, name: "b".into(), cpu_pct: 0.0, mem_mb: 0,
+                state: VmState::Running, uptime_secs: 0,
                 disk_read_bps: 10, disk_write_bps: 10, net_rx_bps: 0, net_tx_bps: 0,
             },
         ];
         sort_vms(&mut vms, SortBy::DiskIo);
         assert_eq!(vms[0].pid, 1);
+    }
+
+    #[test]
+    fn vm_state_maps_process_status() {
+        // Normaal draaiend (incl. de idle event-loop van een rustende VM en een
+        // libvirt-"paused" guest, die beide Sleep zijn) -> "up".
+        assert_eq!(VmState::from_status(ProcessStatus::Run).label(), "up");
+        assert_eq!(VmState::from_status(ProcessStatus::Sleep).label(), "up");
+        assert_eq!(VmState::from_status(ProcessStatus::Idle).label(), "up");
+        // Vastgelopen op storage -> "io".
+        assert_eq!(
+            VmState::from_status(ProcessStatus::UninterruptibleDiskSleep).label(),
+            "io"
+        );
+        // SIGSTOP'd of getraced -> "stop".
+        assert_eq!(VmState::from_status(ProcessStatus::Stop).label(), "stop");
+        assert_eq!(VmState::from_status(ProcessStatus::Tracing).label(), "stop");
+        // Gecrasht/afstervend -> "dead".
+        assert_eq!(VmState::from_status(ProcessStatus::Zombie).label(), "dead");
+        assert_eq!(VmState::from_status(ProcessStatus::Dead).label(), "dead");
+        // Onbekende status -> "?".
+        assert_eq!(VmState::from_status(ProcessStatus::Parked).label(), "?");
+        assert_eq!(VmState::from_status(ProcessStatus::Unknown(42)).label(), "?");
+    }
+
+    #[test]
+    fn fmt_uptime_picks_two_significant_units() {
+        assert_eq!(fmt_uptime(0), "0s");
+        assert_eq!(fmt_uptime(12), "12s");
+        assert_eq!(fmt_uptime(45 * 60 + 10), "45m10s");
+        assert_eq!(fmt_uptime(3 * 3600 + 5 * 60), "3h5m");
+        assert_eq!(fmt_uptime(18 * 3600 + 30 * 60), "18h30m");
+        // Dagen dringen minuten weg: alleen d+h.
+        assert_eq!(fmt_uptime(4 * 86_400 + 2 * 3600 + 59 * 60), "4d2h");
+        // Exact een uur -> "1h0m", exact een dag -> "1d0h".
+        assert_eq!(fmt_uptime(3600), "1h0m");
+        assert_eq!(fmt_uptime(86_400), "1d0h");
     }
 
     #[test]

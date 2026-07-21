@@ -4,8 +4,8 @@
 %global debug_package %{nil}
 
 Name:           abyss-top
-Version:        1.0.0
-Release:        2%{?dist}
+Version:        1.1.0
+Release:        1%{?dist}
 Summary:        Lightweight KVM/QEMU hypervisor TUI monitor for RHEL
 
 License:        ASL 2.0
@@ -78,6 +78,15 @@ fi
 %{_bindir}/%{name}
 
 %changelog
+* Tue Jul 21 2026 David <david@cerberus.io> - 1.1.0-1
+- Guest table gains three columns/rows: per-VM STATE (the QEMU process state
+  from /proc/<pid>/stat via sysinfo — up / io / stop / dead, so a hung,
+  SIGSTOP'd or defunct guest stands out; note this is the OS process state,
+  not the libvirt domain state, so a libvirt-"paused" guest still reads
+  "up"), per-VM UPTIME (process run time), and a bottom TOTAL row summing
+  CPU / memory / disk / net across all guests. Still pure /proc + /sys, no
+  new dependencies.
+
 * Tue Jul 14 2026 David <david@cerberus.io> - 1.0.0-2
 - Per-vCPU NUMA placement + host-contention detail view: press Enter on a
   selected guest to see each vCPU thread's current physical CPU, NUMA node,
