@@ -108,14 +108,17 @@ jobs:
       - name: Install build dependencies
         run: |
           set -e
+          # cargo + rust via dnf i.p.v. rustup: rpmbuild controleert de
+          # BuildRequires (cargo/rust >= 1.75) tegen de RPM-database, en een
+          # rustup-toolchain is geen RPM — dat gaf "Failed build dependencies"
+          # nog vóór %build. RHEL/Rocky 9 AppStream levert inmiddels
+          # rust-toolset >= 1.79 (ruim boven het minimum, met edition 2021).
+          # Zelfde aanpak als de lokale podman-build in packaging/.
           dnf install -y --setopt=install_weak_deps=False \
             gcc rpm-build rpmdevtools git tar findutils file which \
-            ca-certificates
-          # Rust via rustup — RHEL 9's pakket-rust is vaak achter op edition 2021
-          # en op het versie-minimum dat moderne crates eisen.
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain stable --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            ca-certificates cargo rust
+          cargo --version
+          rustc --version
 
       - uses: actions/checkout@v4
 
