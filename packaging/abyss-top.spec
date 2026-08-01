@@ -4,7 +4,7 @@
 %global debug_package %{nil}
 
 Name:           abyss-top
-Version:        1.1.0
+Version:        1.2.0
 Release:        1%{?dist}
 Summary:        Lightweight KVM/QEMU hypervisor TUI monitor for RHEL
 
@@ -78,6 +78,17 @@ fi
 %{_bindir}/%{name}
 
 %changelog
+* Sat Aug 01 2026 David <david@cerberus.io> - 1.2.0-1
+- New LIBVIRT column showing the real libvirt domain state, polled from
+  `virsh list --all` on a background thread every ~5s (never blocking the
+  UI, even if libvirtd is wedged). This closes the gap documented since
+  1.1.0: the existing STATE column only ever reflected the QEMU OS process
+  state, so a libvirt-"paused" guest still showed "up". If virsh isn't
+  installed the column falls back to "-" and stays passive for the rest of
+  the run; a transient libvirtd connection failure just skips that poll and
+  keeps the last-known state. No new dependencies (stdlib thread + mpsc
+  only).
+
 * Tue Jul 21 2026 David <david@cerberus.io> - 1.1.0-1
 - Guest table gains three columns/rows: per-VM STATE (the QEMU process state
   from /proc/<pid>/stat via sysinfo — up / io / stop / dead, so a hung,
