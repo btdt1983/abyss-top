@@ -1,11 +1,12 @@
 // abyss-top — KVM/QEMU Hypervisor TUI Monitor
 //
 // Doelplatform: RHEL 9 / Rocky / AlmaLinux (FIPS-capable hosts).
-// FIPS-houding: deze binary doet ALLEEN lokale /proc-telemetrie en QEMU
-// argv-inspectie. Geen crypto-crates. Wordt later TLS-export toegevoegd,
-// dan MOET die dynamisch linken tegen de FIPS-gevalideerde OpenSSL van de
-// host of `aws-lc-rs` met de `fips` feature. Pure-Rust crypto (ring,
-// RustCrypto) is hier verboden.
+// FIPS-houding: deze binary doet lokale /proc-telemetrie, QEMU argv-
+// inspectie, en (optioneel) een lokale `virsh`-subprocess-aanroep over een
+// UNIX-socket naar libvirtd — geen netwerk, geen TLS, geen crypto-crates.
+// Wordt later TLS-export toegevoegd, dan MOET die dynamisch linken tegen de
+// FIPS-gevalideerde OpenSSL van de host of `aws-lc-rs` met de `fips`
+// feature. Pure-Rust crypto (ring, RustCrypto) is hier verboden.
 //
 // Cargo.toml dependencies:
 //   anyhow    = "1.0"
@@ -18,6 +19,9 @@ use std::{
     fs,
     io::{self, Stdout},
     panic,
+    process::Command,
+    sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -40,6 +44,11 @@ use sysinfo::{ProcessRefreshKind, ProcessStatus, RefreshKind, System};
 // Refresh-cadans. sysinfo CPU% vereist >= MINIMUM_CPU_UPDATE_INTERVAL tussen
 // refreshes; 1 s zit ruim boven de ~200ms ondergrens en geeft stabiele delta's.
 const TICK_RATE: Duration = Duration::from_millis(1000);
+
+// Cadans voor de achtergrond-poll van de libvirt-domeinstatus. Losstaand van
+// TICK_RATE: `virsh list --all` elke tick spawnen zou overbodige overhead
+// zijn, domeinstatus verandert niet op sub-seconde schaal.
+const LIBVIRT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 // ---------- Data-model ----------------------------------------------------
 
@@ -189,6 +198,141 @@ impl VmState {
     }
 }
 
+/// De echte libvirt-*domeinstatus* (via `virsh list --all`), los van
+/// `VmState` hierboven — dit vult precies het gat dat de doc-comment op
+/// `VmState` beschrijft: een libvirt-"paused" guest hier is `Paused`, ook al
+/// toont `VmState` gewoon `up`. `virDomainState` is een gesloten vocabulaire
+/// (stabiel sinds libvirt's introductie ervan), dus bewust geen catch-all
+/// variant: `parse_virsh_list` construeert nooit iets anders dan deze acht.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibvirtDomainState {
+    Running,
+    Idle,
+    Paused,
+    InShutdown,
+    ShutOff,
+    Crashed,
+    PmSuspended,
+    NoState,
+}
+
+impl LibvirtDomainState {
+    /// Korte cellabel voor de tabel.
+    fn label(self) -> &'static str {
+        match self {
+            LibvirtDomainState::Running => "run",
+            LibvirtDomainState::Idle => "idle",
+            LibvirtDomainState::Paused => "pause",
+            LibvirtDomainState::InShutdown => "down",
+            LibvirtDomainState::ShutOff => "off",
+            LibvirtDomainState::Crashed => "crash",
+            LibvirtDomainState::PmSuspended => "pmsus",
+            LibvirtDomainState::NoState => "none",
+        }
+    }
+
+    /// Kleur: groen = actief, geel = onderweg naar uit / geslapen, rood =
+    /// uit of gecrasht, grijs = geen status bekend.
+    fn color(self) -> Color {
+        match self {
+            LibvirtDomainState::Running | LibvirtDomainState::Idle => Color::Green,
+            LibvirtDomainState::Paused
+            | LibvirtDomainState::PmSuspended
+            | LibvirtDomainState::InShutdown => Color::Yellow,
+            LibvirtDomainState::ShutOff | LibvirtDomainState::Crashed => Color::Red,
+            LibvirtDomainState::NoState => Color::DarkGray,
+        }
+    }
+}
+
+const KNOWN_LIBVIRT_STATES: &[(&str, LibvirtDomainState)] = &[
+    ("in shutdown", LibvirtDomainState::InShutdown),
+    ("pmsuspended", LibvirtDomainState::PmSuspended),
+    ("shut off", LibvirtDomainState::ShutOff),
+    ("no state", LibvirtDomainState::NoState),
+    ("running", LibvirtDomainState::Running),
+    ("crashed", LibvirtDomainState::Crashed),
+    ("paused", LibvirtDomainState::Paused),
+    ("idle", LibvirtDomainState::Idle),
+];
+
+/// Pure parser voor `virsh list --all`-tabeloutput. Matcht per regel het
+/// bekende statuswoord (of de twee-woorden-varianten "shut off"/"in
+/// shutdown"/"no state") als suffix, met een spatie ervoor als grens — de
+/// rest ervoor (na de Id-kolom) is de domeinnaam, ongeacht spaties erin.
+/// Regels zonder herkenbaar statuswoord (header, `---`-scheidingsregel,
+/// lege/kapotte regels) matchen simpelweg niets en worden overgeslagen; er
+/// is dus geen aparte header/separator-detectie nodig.
+fn parse_virsh_list(output: &str) -> HashMap<String, LibvirtDomainState> {
+    let mut states = HashMap::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((_id, rest)) = trimmed.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+
+        let matched = KNOWN_LIBVIRT_STATES.iter().find_map(|&(word, state)| {
+            let before = rest.strip_suffix(word)?;
+            if before.is_empty() || !before.ends_with(char::is_whitespace) {
+                return None; // geen spatie-grens ervoor -> geen echte match
+            }
+            Some((before.trim_end().to_string(), state))
+        });
+
+        if let Some((name, state)) = matched {
+            if !name.is_empty() {
+                states.insert(name, state);
+            }
+        }
+    }
+    states
+}
+
+/// Uitkomst van één achtergrond-poll, zie `poll_libvirt_once`.
+enum LibvirtPollResult {
+    /// Succesvol uitgevoerd en geparsed; kan een lege map zijn (geen
+    /// domeinen gedefinieerd) — dat is geen fout.
+    Parsed(HashMap<String, LibvirtDomainState>),
+    /// `virsh` is gestart maar gaf een foutcode (bv. libvirtd tijdelijk
+    /// onbereikbaar tijdens een herstart) — transient: deze cyclus wordt
+    /// overgeslagen, de vorige cache blijft staan, over
+    /// `LIBVIRT_POLL_INTERVAL` wordt het opnieuw geprobeerd.
+    ConnectionFailed,
+    /// `virsh` kon niet eens gestart worden (bv. ENOENT — geen libvirt-
+    /// client geïnstalleerd, of handmatig gestarte qemu zonder libvirt) —
+    /// structureel: schakelt de kolom blijvend uit voor de rest van de run.
+    NotFound,
+}
+
+/// Draait op een achtergrond-thread (`thread::spawn` vanuit `App::refresh`).
+/// Blokkeert zelf wél op het virsh-kindproces, maar dat raakt de render-loop
+/// nooit — het resultaat komt non-blocking terug via `tx`.
+fn poll_libvirt_once(tx: mpsc::Sender<LibvirtPollResult>) {
+    // -c qemu:///system: pin op de lokale hypervisor. Zonder expliciete URI
+    // volgt virsh $LIBVIRT_DEFAULT_URI, wat op een voor remote-beheer
+    // geconfigureerde host zelfs qemu+ssh:// kan zijn — dat zou in het
+    // ergste geval hangen op een prompt die nooit komt (stdin is null).
+    // LC_ALL=C: virsh's statuswoorden zijn gettext-vertaald; zonder dit
+    // matcht de parser op een niet-Engelse host nergens en toont de kolom
+    // stil overal "-".
+    let result = match Command::new("virsh")
+        .args(["-c", "qemu:///system", "list", "--all"])
+        .env("LC_ALL", "C")
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            LibvirtPollResult::Parsed(parse_virsh_list(&String::from_utf8_lossy(&out.stdout)))
+        }
+        Ok(_) => LibvirtPollResult::ConnectionFailed,
+        Err(_) => LibvirtPollResult::NotFound,
+    };
+    let _ = tx.send(result); // ontvanger kan al weg zijn (afsluiten); negeer dan gewoon
+}
+
 // ---------- App-state -----------------------------------------------------
 
 struct App {
@@ -220,6 +364,22 @@ struct App {
     /// uitgeklapt, of de geselecteerde VM nog geen data heeft).
     detail: Option<VmDetail>,
     table_state: TableState,
+    /// Laatst bekende libvirt-domeinstatus per VM-naam (join-key = QEMU
+    /// `-name`, gelijk aan de libvirt-domeinnaam). Ontbrekende entry in de
+    /// tabel-lookup betekent: nog geen succesvolle poll, feature blijvend
+    /// uitgeschakeld, of domein onbekend bij virsh — in alle gevallen "-".
+    libvirt_states: HashMap<String, LibvirtDomainState>,
+    libvirt_tx: mpsc::Sender<LibvirtPollResult>,
+    libvirt_rx: mpsc::Receiver<LibvirtPollResult>,
+    /// True zolang een achtergrond-poll loopt — voorkomt overlappende
+    /// virsh-spawns als libvirtd traag of vastgelopen is.
+    libvirt_inflight: bool,
+    /// True na een structurele fout (virsh niet gevonden) — blijvend, nooit
+    /// gereset. Een transiente connectiefout zet dit NIET.
+    libvirt_disabled: bool,
+    /// `None` = nog nooit gepolld (poll meteen bij eerste refresh); anders
+    /// tijdstip van de laatst gestarte poll.
+    libvirt_last_poll: Option<Instant>,
 }
 
 impl App {
@@ -239,6 +399,8 @@ impl App {
         let cpu_to_node = build_cpu_to_node_map();
         let node_count = cpu_to_node.values().copied().collect::<HashSet<_>>().len();
 
+        let (libvirt_tx, libvirt_rx) = mpsc::channel();
+
         Self {
             system,
             vms: Vec::new(),
@@ -253,6 +415,12 @@ impl App {
             prev_thread: HashMap::new(),
             detail: None,
             table_state,
+            libvirt_states: HashMap::new(),
+            libvirt_tx,
+            libvirt_rx,
+            libvirt_inflight: false,
+            libvirt_disabled: false,
+            libvirt_last_poll: None,
         }
     }
 
@@ -381,8 +549,44 @@ impl App {
             self.prev_thread.retain(|(pid, _), _| live.contains(pid));
         }
 
+        self.poll_libvirt_if_due(now);
+
         if self.expanded {
             self.recompute_detail();
+        }
+    }
+
+    /// Niet-blokkerend: pikt een eventueel klaarstaand poll-resultaat op en
+    /// start, als het weer tijd is, een nieuwe achtergrond-poll. Blokkeert
+    /// de render-loop nooit, ook niet als libvirtd vastgelopen is — dat
+    /// blijft op de achtergrond-thread hangen (`libvirt_inflight` voorkomt
+    /// dat er dan een tweede bovenop komt).
+    fn poll_libvirt_if_due(&mut self, now: Instant) {
+        if let Ok(result) = self.libvirt_rx.try_recv() {
+            self.libvirt_inflight = false;
+            match result {
+                LibvirtPollResult::Parsed(states) => self.libvirt_states = states,
+                // Transient: cyclus overslaan, vorige cache laten staan.
+                LibvirtPollResult::ConnectionFailed => {}
+                LibvirtPollResult::NotFound => {
+                    self.libvirt_disabled = true;
+                    self.libvirt_states.clear();
+                }
+            }
+        }
+
+        if self.libvirt_disabled || self.libvirt_inflight {
+            return;
+        }
+        let due = match self.libvirt_last_poll {
+            None => true,
+            Some(t) => now.duration_since(t) >= LIBVIRT_POLL_INTERVAL,
+        };
+        if due {
+            self.libvirt_inflight = true;
+            self.libvirt_last_poll = Some(now);
+            let tx = self.libvirt_tx.clone();
+            thread::spawn(move || poll_libvirt_once(tx));
         }
     }
 
@@ -930,10 +1134,10 @@ mod ui {
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
                 .split(chunks[1]);
-            render_table(f, mid[0], &app.vms, app.sort_by, &mut app.table_state);
+            render_table(f, mid[0], &app.vms, &app.libvirt_states, app.sort_by, &mut app.table_state);
             render_detail(f, mid[1], app.detail.as_ref(), app.node_count);
         } else {
-            render_table(f, chunks[1], &app.vms, app.sort_by, &mut app.table_state);
+            render_table(f, chunks[1], &app.vms, &app.libvirt_states, app.sort_by, &mut app.table_state);
         }
 
         render_footer(f, chunks[2], app.host);
@@ -959,6 +1163,7 @@ mod ui {
         f: &mut Frame,
         area: Rect,
         vms: &[VmStats],
+        libvirt_states: &HashMap<String, LibvirtDomainState>,
         sort_by: SortBy,
         table_state: &mut TableState,
     ) {
@@ -971,6 +1176,7 @@ mod ui {
             Cell::from("PID"),
             Cell::from("VM Name"),
             Cell::from("STATE"),
+            Cell::from("LIBVIRT"),
             Cell::from("UPTIME"),
             Cell::from("CPU %"),
             Cell::from("MEM (MB)"),
@@ -987,6 +1193,7 @@ mod ui {
                     "No running QEMU/KVM guests detected",
                     Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
                 )),
+                Cell::from("-"),
                 Cell::from("-"),
                 Cell::from("-"),
                 Cell::from("-"),
@@ -1012,6 +1219,10 @@ mod ui {
                             v.state.label(),
                             Style::default().fg(v.state.color()),
                         )),
+                        Cell::from(match libvirt_states.get(&v.name) {
+                            Some(s) => Span::styled(s.label(), Style::default().fg(s.color())),
+                            None => Span::styled("-", Style::default().fg(Color::DarkGray)),
+                        }),
                         Cell::from(fmt_uptime(v.uptime_secs)),
                         Cell::from(Span::styled(
                             format!("{:>6.1}", v.cpu_pct),
@@ -1052,6 +1263,7 @@ mod ui {
                         Style::default().fg(Color::White).add_modifier(bold),
                     )),
                     Cell::from(""), // STATE — n.v.t. voor het totaal
+                    Cell::from(""), // LIBVIRT — n.v.t. voor het totaal
                     Cell::from(""), // UPTIME — n.v.t. voor het totaal
                     Cell::from(Span::styled(
                         format!("{:>6.1}", tot_cpu),
@@ -1079,6 +1291,7 @@ mod ui {
             Constraint::Length(8),      // PID
             Constraint::Percentage(18), // VM Name
             Constraint::Length(6),      // STATE
+            Constraint::Length(8),      // LIBVIRT
             Constraint::Length(8),      // UPTIME
             Constraint::Length(8),      // CPU %
             Constraint::Length(10),     // MEM
@@ -1498,6 +1711,77 @@ Inter-|   Receive                                                |  Transmit
         // Onbekende status -> "?".
         assert_eq!(VmState::from_status(ProcessStatus::Parked).label(), "?");
         assert_eq!(VmState::from_status(ProcessStatus::Unknown(42)).label(), "?");
+    }
+
+    #[test]
+    fn parse_virsh_list_single_running_domain() {
+        let output = " Id   Name       State\n\
+                       -------------------------\n\
+                       1     testvm1    running\n";
+        let states = parse_virsh_list(output);
+        assert_eq!(states.len(), 1);
+        assert_eq!(states.get("testvm1"), Some(&LibvirtDomainState::Running));
+    }
+
+    #[test]
+    fn parse_virsh_list_handles_all_known_states() {
+        // Eén regel per bekende statustekst, incl. beide twee-woorden-
+        // varianten en een gemengde Id-kolom (getal + '-').
+        let output = " Id   Name          State\n\
+                       ----------------------------\n\
+                       1     vm-running    running\n\
+                       2     vm-idle       idle\n\
+                       3     vm-paused     paused\n\
+                       -     vm-shutdown   in shutdown\n\
+                       -     vm-shutoff    shut off\n\
+                       -     vm-crashed    crashed\n\
+                       4     vm-pmsus      pmsuspended\n\
+                       -     vm-nostate    no state\n";
+        let states = parse_virsh_list(output);
+        assert_eq!(states.len(), 8);
+        assert_eq!(states.get("vm-running"), Some(&LibvirtDomainState::Running));
+        assert_eq!(states.get("vm-idle"), Some(&LibvirtDomainState::Idle));
+        assert_eq!(states.get("vm-paused"), Some(&LibvirtDomainState::Paused));
+        assert_eq!(states.get("vm-shutdown"), Some(&LibvirtDomainState::InShutdown));
+        assert_eq!(states.get("vm-shutoff"), Some(&LibvirtDomainState::ShutOff));
+        assert_eq!(states.get("vm-crashed"), Some(&LibvirtDomainState::Crashed));
+        assert_eq!(states.get("vm-pmsus"), Some(&LibvirtDomainState::PmSuspended));
+        assert_eq!(states.get("vm-nostate"), Some(&LibvirtDomainState::NoState));
+    }
+
+    #[test]
+    fn parse_virsh_list_empty_output_is_empty_map() {
+        assert!(parse_virsh_list("").is_empty());
+        // Header + scheidingsregel zonder domeinen -> ook leeg, geen panic.
+        let output = " Id   Name   State\n----------------------\n";
+        assert!(parse_virsh_list(output).is_empty());
+    }
+
+    #[test]
+    fn parse_virsh_list_ignores_garbage_lines() {
+        // Een kapotte regel tussen twee goede regels mag de rest niet slopen.
+        let output = " Id   Name       State\n\
+                       -------------------------\n\
+                       1     testvm1    running\n\
+                       this line is garbage\n\
+                       2     testvm2    paused\n";
+        let states = parse_virsh_list(output);
+        assert_eq!(states.len(), 2);
+        assert_eq!(states.get("testvm1"), Some(&LibvirtDomainState::Running));
+        assert_eq!(states.get("testvm2"), Some(&LibvirtDomainState::Paused));
+    }
+
+    #[test]
+    fn parse_virsh_list_name_ending_in_state_like_word_without_space() {
+        // "vm-running" heeft geen spatie vóór "running" binnen de naam zelf
+        // -> de spatie-grens-check moet de échte trailing state ("paused")
+        // vinden, niet per ongeluk op "running" matchen middenin de naam.
+        let output = " Id   Name          State\n\
+                       ----------------------------\n\
+                       1     vm-running    paused\n";
+        let states = parse_virsh_list(output);
+        assert_eq!(states.len(), 1);
+        assert_eq!(states.get("vm-running"), Some(&LibvirtDomainState::Paused));
     }
 
     #[test]

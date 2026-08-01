@@ -12,14 +12,14 @@ FIPS-locked environments, SSH-only ops).
 ┌────────────────────────────────────────────────────────────────────────────┐
 │ Abyss-Top | KVM Hypervisor Monitor  [3 VMs]                                │
 └────────────────────────────────────────────────────────────────────────────┘
-┌ Guests (sorted by CPU) ──────────────────────────────────────────────────────────────┐
-│ PID    VM Name               STATE  UPTIME   CPU %   MEM (MB)   DISK R/W            NET RX/TX      │
-│ 12847  cerberus-node01       up     4d2h      87.3       8192   12.4 MB/s / 3.1 MB/s  870 KB/s / 410 KB/s │
-│ 12931  abyssos-build-runner  up     18h30m    42.1       4096    2.1 MB/s / 5.6 MB/s  120 KB/s /  85 KB/s │
-│ 13102  rocky9-test-vm        io     3h5m       3.4       2048      45 KB/s /  12 KB/s    8 KB/s /   2 KB/s │
+┌ Guests (sorted by CPU) ──────────────────────────────────────────────────────────────────────┐
+│ PID    VM Name               STATE  LIBVIRT  UPTIME   CPU %   MEM (MB)   DISK R/W            NET RX/TX      │
+│ 12847  cerberus-node01       up     run      4d2h      87.3       8192   12.4 MB/s / 3.1 MB/s  870 KB/s / 410 KB/s │
+│ 12931  abyssos-build-runner  up     pause    18h30m    42.1       4096    2.1 MB/s / 5.6 MB/s  120 KB/s /  85 KB/s │
+│ 13102  rocky9-test-vm        io     run      3h5m       3.4       2048      45 KB/s /  12 KB/s    8 KB/s /   2 KB/s │
 │                                                                                                          │
-│ TOTAL  3 VMs                                  132.8      14336   14.5 MB/s / 8.7 MB/s  998 KB/s / 497 KB/s │
-└──────────────────────────────────────────────────────────────────────────────────────┘
+│ TOTAL  3 VMs                                           132.8      14336   14.5 MB/s / 8.7 MB/s  998 KB/s / 497 KB/s │
+└──────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌────────────────────────────────────────────────────────────────────────────┐
 │ Host CPU  44.2%   RAM 14336/32768 MB (43.8%)   sort [C]pu [D]isk [N]et [M]em · [Q]uit │
 └────────────────────────────────────────────────────────────────────────────┘
@@ -30,6 +30,9 @@ Colours in the live UI:
 - **Abyss-Top** title — cyan bold; VM count badge yellow
 - Table header — black on cyan
 - STATE cell — green (`up`), yellow (`io`), red (`stop` / `dead`)
+- LIBVIRT cell — green (`run` / `idle`), yellow (`pause` / `pmsus` / `down`),
+  red (`off` / `crash`), gray (`none`), gray `-` when no libvirt data is
+  available
 - CPU % cell — green (<40), yellow (40–80), red (≥80)
 - Disk R/W column — magenta; Net RX/TX column — light blue
 - TOTAL row — bold, keeping each column's colour
@@ -44,6 +47,11 @@ Colours in the live UI:
   `-name foo`, `--name foo`, `-name=foo`)
 - Per-VM CPU%, RSS, disk read/write throughput, network RX/TX throughput
 - Per-VM state (`up` / `io` / `stop` / `dead`) and uptime
+- Per-VM **libvirt domain state** (`run` / `idle` / `pause` / `pmsus` /
+  `down` / `off` / `crash` / `none`), polled from `virsh list --all` in the
+  background every ~5 s — distinct from the process-based STATE column
+  above (see [How it sees VMs](#how-it-sees-vms)); shows `-` and stays
+  passive if `virsh`/`libvirtd` aren't available
 - A `TOTAL` row summing CPU / memory / disk / net across all guests
 - Host CPU + RAM totals in the footer
 - 1 s refresh, sub-millisecond rendering, single binary
@@ -55,8 +63,9 @@ Colours in the live UI:
 
 ## FIPS posture
 
-This binary performs **only local `/proc` telemetry and QEMU argv inspection.**
-It links no cryptographic crates.
+This binary performs local `/proc` telemetry, QEMU argv inspection, and an
+optional local `virsh` subprocess call (a UNIX-socket connection to
+`libvirtd`, no network, no TLS). It links no cryptographic crates.
 
 If TLS/HTTPS telemetry export is added later, it **must** dynamically link
 against the host's FIPS-validated OpenSSL (RHEL system OpenSSL in FIPS mode)
@@ -206,6 +215,21 @@ per-VM disk and network throughput.
 > `chcon -t bin_t <path>`. No custom policy module is required for the
 > capability above.
 
+### Libvirt domain-state column (optional)
+
+The `LIBVIRT` column needs the `libvirt-client` package (`virsh`) installed
+and a reachable local `libvirtd` (`qemu:///system` — the same privilege
+ballpark as everything else on this page: root, or a user in the `libvirt`
+group). It polls in the background every ~5 s and never blocks the UI.
+
+- If `virsh` isn't installed at all, the column shows `-` for every guest
+  and the feature disables itself for the rest of the run — no retries, no
+  error spam.
+- If `virsh` runs but can't reach `libvirtd` (e.g. mid-restart), that one
+  poll is skipped and the last-known state is kept; it retries again in
+  ~5 s — a brief hiccup doesn't blind the column for the rest of the
+  session.
+
 ---
 
 ## Keys
@@ -229,6 +253,7 @@ The active sort is shown in the guest-table title (`Guests (sorted by …)`).
 | Process discovery   | `sysinfo` — filters on `qemu-system*`, `qemu-kvm`, `kvm` (name + exe path) |
 | VM name             | QEMU argv `-name` parser (all four common forms) |
 | State               | `sysinfo` process status (the state field of `/proc/[pid]/stat`): `up` (Run/Sleep/Idle), `io` (uninterruptible disk-sleep — a possible storage stall), `stop` (SIGSTOP'd or traced), `dead` (zombie/dead). This is the **OS process state, not the libvirt domain state** — a libvirt-*paused* guest keeps its QEMU process in Sleep, so it still reads `up`. What it surfaces is a hung, frozen, or defunct QEMU process, using only `/proc` (no QMP/libvirt). |
+| Libvirt domain state | `virsh list --all`, polled on a background thread every ~5 s (never blocking the UI, even if `libvirtd` is wedged) and joined to a guest **by VM name** (the same name parsed from QEMU `-name`, which is the libvirt domain name for libvirt-managed guests). This is the real domain state — a `paused` guest reads `pause` here even though STATE still shows `up`. If `virsh` is missing entirely the column permanently falls back to `-`; a transient connection failure just keeps the last-known value until the next poll. |
 | Uptime              | `sysinfo` process run time (`/proc/[pid]/stat` start time vs. host boot) |
 | CPU %               | `sysinfo` per-process CPU usage — summed across all vCPU threads, so a busy multi-vCPU guest can read **above 100 %** (e.g. `780.0` for 8 fully-loaded vCPUs). This is intentional: it reflects real host load. |
 | Memory (MB)         | `sysinfo` RSS / 1024²               |
@@ -283,7 +308,9 @@ cargo test
 
 Covers the QEMU argv parser, process detection heuristic, throughput delta
 math (including counter-reset safety), byte formatter scaling, VM-interface
-heuristic, and the sort-mode comparator.
+heuristic, the sort-mode comparator, and the `virsh list --all` output
+parser (canned string fixtures — no live `libvirtd` required to run the
+suite).
 
 ---
 
